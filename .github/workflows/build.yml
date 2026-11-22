@@ -1,0 +1,152 @@
+name: build
+
+# Builds the official sub2api release with patches/*.patch applied and pushes it to
+# ghcr.io/<owner>/sub2api. Runs hourly and only builds a release once.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Official tag to build, e.g. v0.2.24 (empty: latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Build even if this tag was built before"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # record built tags in built-versions.txt
+  packages: write # push to ghcr.io
+  issues: write # tell the owner when upstream already has every patch
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Wei-Shaw/sub2api
+  # linux/amd64,linux/arm64 for both; arm64 runs the final stage under QEMU and is slower.
+  PLATFORMS: linux/amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Pick the version
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          tag=${INPUT_TAG:-$latest}
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/sub2api" >>"$GITHUB_OUTPUT"
+          echo "latest=$([[ $tag == "$latest" ]] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+          if [[ $FORCE != true ]] && grep -qxF "$tag" built-versions.txt 2>/dev/null; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "$tag was already built"
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+            echo "building $tag (latest release: $latest)"
+          fi
+
+      - name: Fetch the official source
+        if: steps.pick.outputs.skip == 'false'
+        id: src
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          git clone --depth 1 --branch "$TAG" "https://github.com/$UPSTREAM.git" src
+          echo "sha=$(git -C src rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Apply patches
+        if: steps.pick.outputs.skip == 'false'
+        id: patch
+        run: scripts/apply-patches.sh src
+
+      - name: Tell the owner upstream has every patch
+        if: steps.pick.outputs.skip == 'false' && steps.patch.outputs.applied == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          MERGED: ${{ steps.patch.outputs.merged }}
+        run: |
+          title="官方 $TAG 已经包含全部补丁，可以换回官方镜像"
+          if [[ -z $(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number') ]]; then
+            gh issue create --title "$title" --body "官方 $TAG 已经包含这些补丁：$MERGED。这次构建的镜像和官方相同，可以把 docker-compose 的镜像换回 weishaw/sub2api，然后停用这个仓库的 Actions。"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.pick.outputs.skip == 'false' && contains(env.PLATFORMS, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.pick.outputs.skip == 'false'
+
+      - uses: docker/login-action@v3
+        if: steps.pick.outputs.skip == 'false'
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        if: steps.pick.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: |
+            ${{ steps.pick.outputs.image }}:${{ steps.pick.outputs.version }}
+            ${{ steps.pick.outputs.latest == 'true' && format('{0}:latest', steps.pick.outputs.image) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.pick.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.src.outputs.sha }}
+            org.opencontainers.image.description=sub2api ${{ steps.pick.outputs.tag }} with the patches in ${{ github.repository }}
+          # The Dockerfile defaults to goproxy.cn, which is slow from GitHub's runners.
+          build-args: |
+            VERSION=${{ steps.pick.outputs.version }}
+            COMMIT=${{ steps.src.outputs.sha }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record the built tag
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          grep -qxF "$TAG" built-versions.txt 2>/dev/null || echo "$TAG" >>built-versions.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add built-versions.txt
+          git diff --cached --quiet || git commit -m "build: $TAG"
+          git push
+
+      - name: Summary
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          IMAGE: ${{ steps.pick.outputs.image }}
+          VERSION: ${{ steps.pick.outputs.version }}
+          LATEST: ${{ steps.pick.outputs.latest }}
+          APPLIED: ${{ steps.patch.outputs.applied }}
+          MERGED: ${{ steps.patch.outputs.merged }}
+        run: |
+          {
+            echo "### $IMAGE:$VERSION"
+            echo "- 打上的补丁：$APPLIED 个"
+            echo "- 官方已经包含、跳过的补丁：${MERGED:-无}"
+            echo "- 同时更新 latest：$LATEST"
+          } >>"$GITHUB_STEP_SUMMARY"
