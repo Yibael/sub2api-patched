@@ -19,7 +19,7 @@
    - 能打上的就打上；
    - 官方代码里已经有了的就跳过（说明官方合并了）；
    - 两者都不是就失败，GitHub 会发邮件，需要手动更新补丁。
-3. 用官方仓库根目录的 `Dockerfile` 构建，推送 `ghcr.io/yibael/sub2api:<版本号>`；是最新 release 时同时更新 `:latest`。
+3. 把 `docker/append.Dockerfile` 接到官方根目录 `Dockerfile` 的末尾（装 curl，健康检查改成和官方镜像一样用 curl），构建并推送 `ghcr.io/yibael/sub2api:<版本号>`；是最新 release 时同时更新 `:latest`。
 4. 把版本号写进 `built-versions.txt` 并提交。
 5. 如果所有补丁官方都已经包含，开一个 issue 提醒换回官方镜像。
 
@@ -43,5 +43,6 @@
 
 - 公开仓库 60 天没有提交时，GitHub 会停掉定时任务。每次构建都会提交 `built-versions.txt`，官方一直在发版就不会停；停了的话在 Actions 页面重新启用。
 - 默认只构建 `linux/amd64`。服务器是 ARM 的话，把 workflow 里的 `PLATFORMS` 改成 `linux/amd64,linux/arm64`（arm64 的最后一步在 QEMU 里跑，会慢一些）。
-- 官方发布的镜像是用预先编译好的二进制打包的；这里用根目录的 `Dockerfile` 从源码构建，内容相同，但镜像不是同一个文件。
+- 官方发布的镜像是用预先编译好的二进制打包的（`Dockerfile.goreleaser`）；这里用根目录的 `Dockerfile` 从源码构建，再补上 curl。剩下的一处不同是 `/app` 目录属于 root（官方属于 sub2api 用户）。
+- **不要用 sub2api 管理后台的「在线更新」。** 它会把官方程序写进 `/app` 替换掉打了补丁的程序；这里 `/app` 属于 root，在线更新会失败，正好避免补丁被悄悄丢掉。更新一律走拉新镜像。
 - sub2api 使用 LGPL-3.0 许可证。镜像公开时需要同时公开修改过的源码，这个仓库里的补丁就是全部修改。

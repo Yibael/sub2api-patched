@@ -73,6 +73,10 @@ jobs:
         id: patch
         run: scripts/apply-patches.sh src
 
+      - name: Match the official image
+        if: steps.pick.outputs.skip == 'false'
+        run: cat docker/append.Dockerfile >>src/Dockerfile
+
       - name: Tell the owner upstream has every patch
         if: steps.pick.outputs.skip == 'false' && steps.patch.outputs.applied == '0'
         env:
